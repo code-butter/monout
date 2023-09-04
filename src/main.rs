@@ -10,13 +10,17 @@ use std::fs::File;
 use std::io::Read;
 use std::process::{exit, Stdio};
 use std::sync::Arc;
+use std::time::Duration;
 use async_trait::async_trait;
 use anyhow::Result;
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use serde::Deserialize;
 use time::OffsetDateTime;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use tokio::process::{Child, Command};
-use tokio::task::JoinSet;
+use tokio::process::{Child, ChildStderr, ChildStdout, Command};
+use tokio::task::JoinHandle;
+use tokio::time::sleep;
 use crate::aws::{AwsLogConfig, AwsLogProcessor};
 use crate::console::ConsoleLogProcessor;
 
@@ -76,22 +80,21 @@ async fn read_stream<R, T>(stream: R, out_type: &OutType, processor: Arc<T>) -> 
     Ok(())
 }
 
-async fn start_process(name: &str, mut process: Process) -> Result<(impl std::future::Future<Output = Result<()>>, impl std::future::Future<Output = Result<()>>)> {
+async fn start_process(name: &str, process: &mut Process) -> Result<(ChildStdout, ChildStderr)> {
     let mut child = run_process(&process.runner.command)?;
     let stdout = child.stdout.take().expect(&*format!("Could not get stdout for {}", name));
     let stderr = child.stderr.take().expect(&*format!("Could not get stderr for {}", name));
-    let processor = match process.log_processor {
+    let processor = match &process.log_processor {
         None => {
             let processor: Arc<dyn LogProcessor> = match process.runner.output_type.as_str() {
                 "console" => {
                     Arc::new(ConsoleLogProcessor { name: name.to_owned() })
                 },
                 "aws" => {
-                    match process.runner.aws {
+                    match &process.runner.aws {
                         None => panic!("{} requires AWS options to be set", name),
                         Some(aws_config) => {
-                            let log_processor: AwsLogProcessor = aws_config.into();
-                            Arc::new(log_processor)
+                            Arc::new(AwsLogProcessor::from_config(aws_config))
                         }
                     }
                 },
@@ -105,9 +108,21 @@ async fn start_process(name: &str, mut process: Process) -> Result<(impl std::fu
         },
         Some(lp) => lp.clone()
     };
-    let out_task = read_stream(stdout, &OutType::Std, processor.clone());
-    let err_task = read_stream(stderr, &OutType::Err, processor.clone());
-    Ok((out_task, err_task))
+    Ok((stdout, stderr))
+}
+
+async fn restart_processes(processes: &mut BTreeMap<String, Process>, futures: &mut FuturesUnordered<JoinHandle<Result<()>>>) -> Result<()> {
+    for (name, process) in processes.iter_mut() {
+        if process.child.as_ref().map(|c| c.id()).is_none() {
+            let outs = start_process(name, process).await?;
+            let processor = process.log_processor.clone().unwrap();
+            let out_task = tokio::spawn(read_stream(outs.0, &OutType::Std, processor.clone()));
+            let err_task = tokio::spawn(read_stream(outs.1, &OutType::Err, processor.clone()));
+            futures.push(out_task);
+            futures.push(err_task);
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -134,14 +149,18 @@ async fn main() -> Result<()> {
             child: None,
         });
     }
-    
-    let mut process = run_process("echo Hi! && sleep 10")?;
-    let log_processor = Arc::new(ConsoleLogProcessor { name: "Test".to_owned() });
-    let stdout = process.stdout.take().expect("Could not get stdout");
-    let stderr = process.stderr.take().expect("Could not get stderr");
-    let mut set = JoinSet::new();
-    set.spawn(read_stream(stdout, &OutType::Std, log_processor.clone()));
-    set.spawn(read_stream(stderr, &OutType::Err, log_processor.clone()));
-    while let Some(_) = set.join_next().await {}
-    Ok(())
+
+    let mut futures = FuturesUnordered::new();
+    restart_processes(&mut processes, &mut futures);
+    loop {
+        match futures.next().await {
+            None => { sleep(Duration::from_millis(100)).await; }
+            Some(result) => {
+                if let Err(error) = result {
+                    eprintln!("monout: A task has failed: {}", error);
+                }
+            }
+        }
+        restart_processes(&mut processes, &mut futures);
+    }
 }

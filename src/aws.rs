@@ -37,6 +37,17 @@ pub struct AwsLogProcessor {
     log_stream_prefix: String
 }
 
+impl AwsLogProcessor {
+    pub fn from_config(config: &AwsLogConfig) -> AwsLogProcessor {
+        AwsLogProcessor {
+            name: config.name.clone(),
+            region: config.region.clone(),
+            log_group: config.log_group.clone(),
+            log_stream_prefix: config.log_stream_prefix.clone()
+        }
+    }
+}
+
 #[async_trait]
 impl LogProcessor for AwsLogProcessor {
     fn get_name(&self) -> &str { &self.name }
