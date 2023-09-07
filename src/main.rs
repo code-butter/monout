@@ -2,7 +2,6 @@ extern crate core;
 
 mod console;
 mod aws;
-mod utils;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -21,7 +20,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::task::JoinHandle;
 use tokio::time::sleep;
-use crate::aws::{AwsLogConfig, AwsLogProcessor};
+use crate::aws::{AwsCredentials, AwsLogConfig, AwsLogProcessor};
 use crate::console::ConsoleLogProcessor;
 
 enum OutType { Std, Err }
@@ -37,6 +36,7 @@ struct Config {
     restart_delay: Option<usize>,
     #[serde(default)]
     console_labels: bool,
+    aws_credentials: Option<AwsCredentials>,
     #[serde(flatten)]
     runners: BTreeMap<String, Runner>
 }
@@ -84,17 +84,17 @@ async fn start_process(name: &str, process: &mut Process) -> Result<(ChildStdout
     let mut child = run_process(&process.runner.command)?;
     let stdout = child.stdout.take().expect(&*format!("Could not get stdout for {}", name));
     let stderr = child.stderr.take().expect(&*format!("Could not get stderr for {}", name));
-    let processor = match &process.log_processor {
+    match &process.log_processor {
         None => {
             let processor: Arc<dyn LogProcessor> = match process.runner.output_type.as_str() {
                 "console" => {
                     Arc::new(ConsoleLogProcessor { name: name.to_owned() })
                 },
                 "aws" => {
-                    match &process.runner.aws {
+                    match &mut process.runner.aws {
                         None => panic!("{} requires AWS options to be set", name),
                         Some(aws_config) => {
-                            Arc::new(AwsLogProcessor::from_config(aws_config))
+                            Arc::new(AwsLogProcessor::from_config(aws_config).await?)
                         }
                     }
                 },
@@ -135,11 +135,16 @@ async fn main() -> Result<()> {
     let mut file = File::open(&args[0])?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
-    let Config { restart_delay, console_labels, runners }: Config = toml::from_str(&content)?;
+    let Config { restart_delay, console_labels, runners, aws_credentials }: Config = toml::from_str(&content)?;
     let mut processes: BTreeMap<String, Process> = BTreeMap::new();
     for (name, mut runner) in runners.into_iter() {
         if runner.restart_delay.is_none() {
             runner.restart_delay = restart_delay.clone();
+        }
+        if let Some(aws) = &mut runner.aws {
+            if aws.credentials.is_none() {
+                aws.credentials = aws_credentials.clone();
+            }
         }
         processes.insert(name, Process {
             last_started: None,
@@ -151,7 +156,7 @@ async fn main() -> Result<()> {
     }
 
     let mut futures = FuturesUnordered::new();
-    restart_processes(&mut processes, &mut futures);
+    restart_processes(&mut processes, &mut futures).await?;
     loop {
         match futures.next().await {
             None => { sleep(Duration::from_millis(100)).await; }
@@ -161,6 +166,6 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        restart_processes(&mut processes, &mut futures);
+        restart_processes(&mut processes, &mut futures).await?;
     }
 }
