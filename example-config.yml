@@ -1,0 +1,17 @@
+
+
+Hello:
+  command: "echo hello && sleep 2"
+  output_type: aws
+  aws:
+    log_group: test-thing
+    log_stream_prefix: hello
+    region: us-west-2
+
+Goodbye:
+  command: "echo goodbye && sleep 3"
+  output_type: aws
+  aws:
+    log_group: test-thing
+    log_stream_prefix: goodbye
+    region: us-west-2

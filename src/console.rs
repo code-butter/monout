@@ -20,12 +20,10 @@ pub struct ConsoleLogProcessor {
 #[async_trait]
 impl LogProcessor for ConsoleLogProcessor {
 
-    fn get_name(&self) -> &str { &self.name }
-
-    async fn log(&self, content: String, out_type: &OutType) -> anyhow::Result<()> {
+    async fn log(&self, timestamp: i64, content: String, out_type: &OutType) -> anyhow::Result<()> {
         match out_type {
-            OutType::Std => println!("{}", content),
-            OutType::Err => eprintln!("{}", content)
+            OutType::Std => print!("{} {}", timestamp, content),
+            OutType::Err => eprint!("{} {}", timestamp, content)
         };
         Ok(())
     }

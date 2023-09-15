@@ -2,170 +2,106 @@ extern crate core;
 
 mod console;
 mod aws;
+mod process;
+mod futures_counter;
 
 use std::collections::BTreeMap;
 use std::env;
 use std::fs::File;
 use std::io::Read;
-use std::process::{exit, Stdio};
-use std::sync::Arc;
-use std::time::Duration;
+use std::process::exit;
 use async_trait::async_trait;
 use anyhow::Result;
-use futures::stream::FuturesUnordered;
-use futures::StreamExt;
+use lazy_static::lazy_static;
+use regex::Regex;
 use serde::Deserialize;
-use time::OffsetDateTime;
-use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
-use tokio::process::{Child, ChildStderr, ChildStdout, Command};
-use tokio::task::JoinHandle;
-use tokio::time::sleep;
-use crate::aws::{AwsCredentials, AwsLogConfig, AwsLogProcessor};
-use crate::console::ConsoleLogProcessor;
+use crate::aws::{AwsCredentials, AwsLogConfig};
+use crate::futures_counter::FuturesCounter;
+use crate::process::Process;
 
-enum OutType { Std, Err }
+lazy_static! {
+    static ref ENV_VAR_MATCHER: Regex = Regex::new(r"^\$\w+$").unwrap();
+}
+
+pub enum OutType { Std, Err }
 
 #[async_trait]
-trait LogProcessor: Sync + Send {
-    fn get_name(&self) -> &str;
-    async fn log(&self, content: String, out_type: &OutType) -> Result<()>;
+pub trait LogProcessor: Sync + Send {
+    async fn log(&self, timestamp: i64, content: String, out_type: &OutType) -> Result<()>;
 }
 
 #[derive(Deserialize)]
-struct Config {
-    restart_delay: Option<usize>,
+pub struct Config {
+    failure_restart_delay: Option<u64>,
     #[serde(default)]
     console_labels: bool,
+    machine_id: Option<String>,
     aws_credentials: Option<AwsCredentials>,
     #[serde(flatten)]
     runners: BTreeMap<String, Runner>
 }
 
 #[derive(Deserialize)]
-struct Runner {
+pub struct Runner {
     command: String,
     output_type: String,
-    restart_delay: Option<usize>,
+    failure_restart_delay: Option<u64>,
+    machine_id: Option<String>,
     aws: Option<AwsLogConfig>
 }
 
-struct Process {
-    last_started: Option<OffsetDateTime>,
-    show_console_label: bool,
-    runner: Runner,
-    log_processor: Option<Arc<dyn LogProcessor>>,
-    child: Option<Child>
-}
-
-fn run_process(command: &str) -> Result<Child> {
-    let child = Command::new("sh")
-        .arg("-c")
-        .arg(command)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    Ok(child)
-}
-
-async fn read_stream<R, T>(stream: R, out_type: &OutType, processor: Arc<T>) -> Result<()>
-    where
-        R: AsyncRead + Unpin,
-        T: LogProcessor + ?Sized
-{
-    let mut reader = BufReader::new(stream);
-    let mut line = String::new();
-    while reader.read_line(&mut line).await.unwrap_or(0) > 0 {
-        processor.log(line.clone(), out_type).await?;
-    };
-    Ok(())
-}
-
-async fn start_process(name: &str, process: &mut Process) -> Result<(ChildStdout, ChildStderr)> {
-    let mut child = run_process(&process.runner.command)?;
-    let stdout = child.stdout.take().expect(&*format!("Could not get stdout for {}", name));
-    let stderr = child.stderr.take().expect(&*format!("Could not get stderr for {}", name));
-    match &process.log_processor {
-        None => {
-            let processor: Arc<dyn LogProcessor> = match process.runner.output_type.as_str() {
-                "console" => {
-                    Arc::new(ConsoleLogProcessor { name: name.to_owned() })
-                },
-                "aws" => {
-                    match &mut process.runner.aws {
-                        None => panic!("{} requires AWS options to be set", name),
-                        Some(aws_config) => {
-                            Arc::new(AwsLogProcessor::from_config(aws_config).await?)
-                        }
-                    }
-                },
-                _ => {
-                    panic!("Unknown output_type for {}: {}", name, process.runner.output_type);
-                }
-            };
-            let clone = processor.clone();
-            process.log_processor = Some(processor);
-            clone
-        },
-        Some(lp) => lp.clone()
-    };
-    Ok((stdout, stderr))
-}
-
-async fn restart_processes(processes: &mut BTreeMap<String, Process>, futures: &mut FuturesUnordered<JoinHandle<Result<()>>>) -> Result<()> {
-    for (name, process) in processes.iter_mut() {
-        if process.child.as_ref().map(|c| c.id()).is_none() {
-            let outs = start_process(name, process).await?;
-            let processor = process.log_processor.clone().unwrap();
-            let out_task = tokio::spawn(read_stream(outs.0, &OutType::Std, processor.clone()));
-            let err_task = tokio::spawn(read_stream(outs.1, &OutType::Err, processor.clone()));
-            futures.push(out_task);
-            futures.push(err_task);
+fn env_replace<T: Into<Option<String>>>(value: T) -> Option<String> {
+    let optional_str = value.into();
+    match optional_str {
+        None => None,
+        Some(str) => {
+            let trimmed = str.trim();
+            if ENV_VAR_MATCHER.is_match(trimmed) {
+                env::var(trimmed.replace("$", "")).ok()
+            } else {
+                Some(str.to_owned())
+            }
         }
     }
-    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    if args.len() != 1 {
+    if args.len() != 2 {
         eprintln!("monout only takes one argument: the location of the configuration file.");
         exit(1);
     }
-    let mut file = File::open(&args[0])?;
+    let mut file = File::open(&args[1])?;
     let mut content = String::new();
     file.read_to_string(&mut content)?;
-    let Config { restart_delay, console_labels, runners, aws_credentials }: Config = toml::from_str(&content)?;
+    let Config { failure_restart_delay: restart_delay, console_labels, runners, aws_credentials, mut machine_id }: Config = serde_yaml::from_str(&content)?;
+    machine_id = env_replace(machine_id);
     let mut processes: BTreeMap<String, Process> = BTreeMap::new();
     for (name, mut runner) in runners.into_iter() {
-        if runner.restart_delay.is_none() {
-            runner.restart_delay = restart_delay.clone();
+        if runner.failure_restart_delay.is_none() {
+            runner.failure_restart_delay = restart_delay;
+        }
+        match runner.machine_id {
+            None => { runner.machine_id = machine_id.clone(); }
+            Some(str) => { runner.machine_id = env_replace(str); }
         }
         if let Some(aws) = &mut runner.aws {
             if aws.credentials.is_none() {
                 aws.credentials = aws_credentials.clone();
             }
         }
-        processes.insert(name, Process {
-            last_started: None,
-            show_console_label: console_labels,
-            runner,
-            log_processor: None,
-            child: None,
-        });
+        let mut process = Process::from_runner(&name, runner).await?;
+        process.show_console_label = console_labels;
+        processes.insert(name,process);
     }
-
-    let mut futures = FuturesUnordered::new();
-    restart_processes(&mut processes, &mut futures).await?;
-    loop {
-        match futures.next().await {
-            None => { sleep(Duration::from_millis(100)).await; }
-            Some(result) => {
-                if let Err(error) = result {
-                    eprintln!("monout: A task has failed: {}", error);
-                }
-            }
-        }
-        restart_processes(&mut processes, &mut futures).await?;
+    let mut futures = FuturesCounter::new();
+    for (_, process) in processes {
+        let static_ref: &'static mut Process = Box::leak(Box::new(process));
+        futures.push(tokio::spawn(static_ref.run()))
+    };
+    while !futures.is_empty() {
+        futures.next().await;
     }
+    Ok(())
 }
