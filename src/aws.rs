@@ -5,7 +5,8 @@ use anyhow::Result;
 use aws_sdk_cloudwatchlogs::config::Region;
 use aws_sdk_cloudwatchlogs::error::SdkError;
 use aws_sdk_cloudwatchlogs::types::InputLogEvent;
-use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
+use aws_smithy_runtime_api::client::orchestrator::HttpResponse;
+use time::serde::format_description;
 use crate::{OutType, LogProcessor};
 
 #[derive(Deserialize,Debug)]
@@ -71,7 +72,8 @@ impl AwsLogProcessor {
 
     pub fn get_stream_name(&self) -> String {
         let now = time::OffsetDateTime::now_utc();
-        let date = format!("{}/{}/{}", now.year(), now.month(), now.day());
+        let format = time::format_description::parse("[year]/[month]/[day]").unwrap();
+        let date = now.format(&format).unwrap();
         match &self.machine_id {
             None => format!("{}/{}", date, self.log_stream_prefix),
             Some(machine_id) => format!("{}/{}/{}", date, self.log_stream_prefix, machine_id)
