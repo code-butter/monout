@@ -37,7 +37,6 @@ pub struct Config {
     console_labels: bool,
     machine_id: Option<String>,
     aws_credentials: Option<AwsCredentials>,
-    #[serde(flatten)]
     runners: BTreeMap<String, Runner>
 }
 
