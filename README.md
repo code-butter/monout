@@ -8,6 +8,16 @@ This is currently an experiment. Support for outputting to the console and to AW
 with this project I will make it more easily extensible to pipe logs and metrics anywhere you like. The configuration 
 file format will be considered stable once this project reaches version 1. 
 
+
+## Compiling
+
+For now binaries are not provided. They will be if I continue with this project. 
+
+1. You will need to install Rust and Cargo (https://doc.rust-lang.org/cargo/getting-started/installation.html)
+2. In this project directory run `cargo build -r`. There will likely be warnings up until the v1 release.
+3. The `monout` binary will be in `target/release`. 
+4. If you need the binary for a different platform please consult the Cargo documentation. 
+
 ## Usage
 
 Define a YAML file that contains your runners: 
@@ -30,6 +40,8 @@ runners:
       log_stream_prefix: goodbye
       region: us-west-2
 ```
+
+Then pass the configuration file as the only argument to the binary: `monout config.yml`
 
 This will output to the log group named `test-thing`, to a stream "YYYY/mm/dd/{log_streem_prefix}".  
 
